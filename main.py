@@ -257,17 +257,22 @@ app.add_middleware(
 )
 
 # --- SSE ---
-_sse_transport = SseServerTransport("/messages/")
+_sse_transport = SseServerTransport("/messages")
 
-async def sse_asgi_app(scope, receive, send):
-    async with _sse_transport.connect_sse(scope, receive, send) as (read_stream, write_stream):
-        await mcp._mcp_server.run(
-            read_stream, write_stream,
-            mcp._mcp_server.create_initialization_options()
-        )
+async def sse_endpoint(request: Request):
+    async def sse_asgi_app(scope, receive, send):
+        async with _sse_transport.connect_sse(scope, receive, send) as (read_stream, write_stream):
+            await mcp._mcp_server.run(
+                read_stream, write_stream,
+                mcp._mcp_server.create_initialization_options()
+            )
+    return sse_asgi_app
 
-app.mount("/sse", sse_asgi_app)
-app.mount("/messages", _sse_transport.handle_post_message)
+async def messages_endpoint(request: Request):
+    return _sse_transport.handle_post_message
+
+app.add_route("/sse", sse_endpoint, methods=["GET"])
+app.add_route("/messages", messages_endpoint, methods=["POST"])
 
 
 # --- Streamable HTTP ---
