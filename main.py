@@ -1,77 +1,54 @@
-from fastapi import Request, Response
+from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 from mcp.server.fastmcp import FastMCP
 from mcp.server.sse import SseServerTransport
-import os, json, asyncio
+import os
+import json
+import asyncio
 import httpx
 
 # ═══════════════════════════════════════════
-# 🔧 Zeabur MCP Server - HTTP/SSE 双模式
+# 🦊 Zeabur MCP - HTTP/SSE 双模式
 # ═══════════════════════════════════════════
 #
 # 部署到 Zeabur，RikkaHub 添加 MCP 连接:
 #   Streamable HTTP: https://你的域名/mcp
-#   SSE: https://你的域名/sse
+#   SSE (备用):      https://你的域名/sse
 #
 # 环境变量:
 #   ZEABUR_TOKEN - Zeabur API Token (必填)
-#   PORT         - 端口 (默认 8765)
+#   PORT          - 端口 (默认 8765)
 #
 
 ZEABUR_TOKEN = os.environ.get("ZEABUR_TOKEN", "").strip()
-GRAPHQL_URL = "https://api.zeabur.com/graphql"
 PORT = int(os.environ.get("PORT", 8765))
 
-mcp = FastMCP("ZeaburMCP")
+GRAPHQL_URL = "https://api.zeabur.com/graphql"
 
+mcp = FastMCP("Zeabur")
 
-# ═══════════════════════════════════════════
-# GraphQL 查询封装
-# ═══════════════════════════════════════════
+# ── GraphQL Helper ──
 
 async def gql(query: str, variables: dict = None) -> dict:
-    if not ZEABUR_TOKEN:
-        return {"error": "未配置 ZEABUR_TOKEN"}
-    payload = {"query": query}
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {ZEABUR_TOKEN}",
+    }
+    body = {"query": query}
     if variables:
-        payload["variables"] = variables
-    try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.post(
-                GRAPHQL_URL,
-                json=payload,
-                headers={
-                    "Content-Type": "application/json",
-                    "Authorization": f"Bearer {ZEABUR_TOKEN}",
-                },
-            )
-            data = resp.json()
-            if data.get("errors"):
-                return {"error": data["errors"]}
-            return data.get("data", {})
-    except Exception as e:
-        return {"error": str(e)}
+        body["variables"] = variables
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.post(GRAPHQL_URL, json=body, headers=headers)
+        data = resp.json()
+        if "errors" in data:
+            return {"error": data["errors"]}
+        return data.get("data", {})
 
 
-def fmt(data: dict) -> str:
-    """格式化输出，去掉嵌套太深的结构"""
-    return json.dumps(data, indent=2, ensure_ascii=False)
-
-
-def extract_logs(logs_data: dict) -> str:
-    """从 GraphQL 返回中提取日志，格式化为可读文本"""
-    lines = []
-    for key in ("buildLogs", "runtimeLogs"):
-        entries = logs_data.get(key, [])
-        if isinstance(entries, list):
-            for entry in entries:
-                ts = entry.get("timestamp", "")
-                msg = entry.get("message", "")
-                if msg:
-                    lines.append(f"{ts}  {msg}")
-    if not lines:
-        return json.dumps(logs_data, indent=2, ensure_ascii=False)
-    return "\n".join(lines)
+def fmt(obj, title="") -> str:
+    text = json.dumps(obj, ensure_ascii=False, indent=2)
+    return f"{title}{text}" if title else text
 
 
 # ═══════════════════════════════════════════
@@ -80,7 +57,7 @@ def extract_logs(logs_data: dict) -> str:
 
 @mcp.tool()
 async def list_projects() -> str:
-    """列出所有 Zeabur 项目，包含项目ID、名称、区域和环境ID"""
+    """列出所有 Zeabur 项目，返回项目ID、名称、区域和环境ID。"""
     query = """
     query ListProjects {
       projects {
@@ -112,22 +89,12 @@ async def list_projects() -> str:
 
 @mcp.tool()
 async def list_services(project_id: str) -> str:
-    """列出指定项目下的所有服务
-
-    参数:
-      project_id: 项目ID (从 list_projects 获取)
-    """
+    """列出指定项目下的所有服务。project_id 从 list_projects 获取。"""
     query = """
     query ListServices($projectID: ObjectID!) {
       services(projectID: $projectID) {
         edges {
-          node {
-            _id
-            name
-            template
-            createdAt
-            status
-          }
+          node { _id name template createdAt status }
         }
       }
     }
@@ -137,32 +104,25 @@ async def list_services(project_id: str) -> str:
         return f"❌ {data['error']}"
     services = data.get("services", {}).get("edges", [])
     if not services:
-        return "📭 该项目下没有服务"
+        return "📭 项目下没有服务"
     lines = []
     for s in services:
         n = s["node"]
-        lines.append(f"🖥️ {n['name']} (ID: {n['_id']})")
-        lines.append(f"   状态: {n['status']} | 模板: {n['template']} | 创建: {n['createdAt']}")
+        lines.append(f"🔧 {n['name']} (ID: {n['_id']})")
+        lines.append(f"   模板: {n.get('template','N/A')} | 状态: {n.get('status','N/A')} | 创建: {n.get('createdAt','N/A')[:10]}")
     return "\n".join(lines)
 
 
 @mcp.tool()
 async def get_service(service_id: str) -> str:
-    """获取服务的详细信息，包含域名、Dockerfile、最近部署
-
-    参数:
-      service_id: 服务ID (从 list_services 获取)
-    """
+    """获取服务详情，包括域名、Dockerfile、最近部署记录。"""
     query = """
     query GetService($id: ObjectID!) {
       service(_id: $id) {
-        _id
-        name
-        template
-        status
-        createdAt
+        _id name template createdAt status
         domains { _id domain status isGenerated }
-        deployments(_first: 3) { _id status createdAt }
+        spec { source { dockerfile } }
+        deployments { _id status createdAt startedAt finishedAt }
       }
     }
     """
@@ -171,70 +131,50 @@ async def get_service(service_id: str) -> str:
         return f"❌ {data['error']}"
     svc = data.get("service", {})
     if not svc:
-        return "📭 服务不存在"
-    lines = [f"🖥️ {svc['name']} (ID: {svc['_id']})"]
-    lines.append(f"状态: {svc['status']} | 模板: {svc['template']}")
+        return "📭 未找到该服务"
+    lines = [f"🔧 {svc['name']} (ID: {svc['_id']})"]
+    lines.append(f"   状态: {svc.get('status')} | 模板: {svc.get('template')}")
     domains = svc.get("domains", [])
     if domains:
-        lines.append(f"域名:")
         for d in domains:
-            lines.append(f"  - {d['domain']} ({d['status']})")
+            lines.append(f"   🌐 {d['domain']} ({d['status']})")
     deploys = svc.get("deployments", [])
     if deploys:
-        lines.append(f"最近部署:")
-        for dp in deploys[:3]:
-            lines.append(f"  - {dp['_id'][:12]}... {dp['status']} {dp['createdAt']}")
+        d = deploys[0]
+        lines.append(f"   📋 最近部署: {d['status']} @ {d.get('createdAt','N/A')[:19]}")
+        lines.append(f"      部署ID: {d['_id']}")
     return "\n".join(lines)
 
 
 @mcp.tool()
 async def get_deployments(service_id: str, environment_id: str) -> str:
-    """获取服务的部署记录列表
-
-    参数:
-      service_id: 服务ID
-      environment_id: 环境ID (从 list_projects 获取)
-    """
+    """获取服务的部署历史。service_id 从 list_services 获取，environment_id 从 list_projects 获取。"""
     query = """
     query GetDeployments($serviceId: ObjectID!, $environmentId: ObjectID!) {
       deployments(serviceID: $serviceId, environmentID: $environmentId) {
         edges {
-          node {
-            _id
-            status
-            createdAt
-            startedAt
-            finishedAt
-          }
+          node { _id status createdAt startedAt }
         }
       }
     }
     """
-    data = await gql(query, {
-        "serviceId": service_id,
-        "environmentId": environment_id,
-    })
+    data = await gql(query, {"serviceId": service_id, "environmentId": environment_id})
     if "error" in data:
         return f"❌ {data['error']}"
-    deploys = data.get("deployments", {}).get("edges", [])
-    if not deploys:
+    deps = data.get("deployments", {}).get("edges", [])
+    if not deps:
         return "📭 没有部署记录"
     lines = []
-    for d in deploys:
+    for d in deps:
         n = d["node"]
-        lines.append(f"🚀 {n['_id']}  [{n['status']}]  {n['createdAt']}")
-        if n.get("finishedAt"):
-            lines.append(f"   完成: {n['finishedAt']}")
+        lines.append(f"📋 {n['_id']}")
+        lines.append(f"   状态: {n['status']} | 创建: {n.get('createdAt','N/A')[:19]} | 开始: {n.get('startedAt','N/A')[:19]}")
     return "\n".join(lines)
 
 
 @mcp.tool()
 async def get_build_logs(deployment_id: str) -> str:
-    """查看指定部署的构建日志（依赖安装、编译等）
-
-    参数:
-      deployment_id: 部署ID (从 get_deployments 获取)
-    """
+    """获取指定部署的构建日志（依赖安装、编译等）。deployment_id 从 get_deployments 获取。"""
     query = """
     query BuildLogs($deploymentId: ObjectID!) {
       buildLogs(deploymentID: $deploymentId) {
@@ -246,39 +186,27 @@ async def get_build_logs(deployment_id: str) -> str:
     data = await gql(query, {"deploymentId": deployment_id})
     if "error" in data:
         return f"❌ {data['error']}"
-    logs = extract_logs(data)
-    if not logs.strip() or logs.strip() == "{}":
+    logs = data.get("buildLogs", [])
+    if not logs:
         return "📭 没有构建日志"
-    return f"📋 构建日志 ({deployment_id}):\n\n{logs}"
+    lines = [f"📋 构建日志 (部署: {deployment_id})"]
+    for entry in logs[-200:]:
+        ts = entry.get("timestamp", "")[:19]
+        msg = entry.get("message", "")
+        lines.append(f"  [{ts}] {msg}")
+    if len(logs) > 200:
+        lines.append(f"  ... 共 {len(logs)} 条，只显示最后200条")
+    return "\n".join(lines)
 
 
 @mcp.tool()
-async def get_runtime_logs(
-    service_id: str,
-    project_id: str,
-    environment_id: str,
-    deployment_id: str = "",
-) -> str:
-    """查看服务的运行时日志（服务运行输出、报错等）
-
-    参数:
-      service_id: 服务ID
-      project_id: 项目ID
-      environment_id: 环境ID
-      deployment_id: 部署ID (可选，用于筛选特定部署的日志)
-    """
-    variables = {
-        "serviceId": service_id,
-        "projectId": project_id,
-        "environmentId": environment_id,
-    }
-    if deployment_id:
-        variables["deploymentId"] = deployment_id
+async def get_runtime_logs(service_id: str, environment_id: str, project_id: str, deployment_id: str = "") -> str:
+    """获取服务运行时日志（服务运行输出）。参数从 list_projects/list_services 获取。可选 deployment_id 筛选特定部署。"""
     query = """
     query GetRuntimeLogs(
       $serviceId: ObjectID!
-      $projectId: ObjectID!
       $environmentId: ObjectID!
+      $projectId: ObjectID!
       $deploymentId: ObjectID
     ) {
       runtimeLogs(
@@ -292,55 +220,35 @@ async def get_runtime_logs(
       }
     }
     """
+    variables = {
+        "serviceId": service_id,
+        "environmentId": environment_id,
+        "projectId": project_id,
+    }
+    if deployment_id:
+        variables["deploymentId"] = deployment_id
     data = await gql(query, variables)
     if "error" in data:
         return f"❌ {data['error']}"
-    logs = extract_logs(data)
-    if not logs.strip() or logs.strip() == "{}":
+    logs = data.get("runtimeLogs", [])
+    if not logs:
         return "📭 没有运行时日志"
-    return f"📋 运行时日志 ({service_id[:12]}...):\n\n{logs}"
-
-
-@mcp.tool()
-async def get_regions() -> str:
-    """列出 Zeabur 可用的区域和服务器"""
-    query = """
-    query ListRegions {
-      servers {
-        edges {
-          node {
-            _id
-            displayName
-            regionCode
-            available
-            price
-          }
-        }
-      }
-    }
-    """
-    data = await gql(query)
-    if "error" in data:
-        return f"❌ {data['error']}"
-    servers = data.get("servers", {}).get("edges", [])
-    if not servers:
-        return "📭 没有可用区域"
-    lines = []
-    for s in servers:
-        n = s["node"]
-        avail = "✅" if n.get("available") else "❌"
-        lines.append(f"{avail} {n['displayName']} ({n['regionCode']}) - server-{n['_id']} ${n.get('price', '?')}")
+    lines = [f"📋 运行时日志 (服务: {service_id})"]
+    for entry in logs[-200:]:
+        ts = entry.get("timestamp", "")[:19]
+        msg = entry.get("message", "")
+        lines.append(f"  [{ts}] {msg}")
+    if len(logs) > 200:
+        lines.append(f"  ... 共 {len(logs)} 条，只显示最后200条")
     return "\n".join(lines)
 
 
 # ═══════════════════════════════════════════
-# FastAPI + SSE/Streamable HTTP 双模式
+# FastAPI + SSE / Streamable HTTP
 # ═══════════════════════════════════════════
 
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-
 app = FastAPI(title="Zeabur MCP")
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -348,8 +256,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
-# SSE 模式
+# --- SSE ---
 _sse_transport = SseServerTransport("/messages")
 
 @app.get("/sse")
@@ -357,9 +264,8 @@ async def handle_sse(request: Request):
     async with _sse_transport.connect_sse(request) as (read_stream, write_stream):
         await mcp._mcp_server.run(
             read_stream, write_stream,
-            mcp._mcp_server.create_initialization_options(),
+            mcp._mcp_server.create_initialization_options()
         )
-
 
 @app.post("/messages")
 async def handle_messages(request: Request):
@@ -367,7 +273,7 @@ async def handle_messages(request: Request):
     return Response()
 
 
-# Streamable HTTP 模式
+# --- Streamable HTTP ---
 @app.post("/mcp")
 async def handle_mcp(request: Request):
     body = await request.json()
@@ -376,11 +282,7 @@ async def handle_mcp(request: Request):
     class StreamResponse:
         def __init__(self):
             self.status_code = 200
-            self.headers = {
-                "content-type": "text/event-stream",
-                "cache-control": "no-cache",
-                "connection": "keep-alive",
-            }
+            self.headers = {"content-type": "text/event-stream", "cache-control": "no-cache", "connection": "keep-alive"}
             self._chunks = []
 
         async def send(self, chunk):
@@ -414,8 +316,8 @@ async def handle_mcp(request: Request):
 
 @app.get("/health")
 async def health():
-    ok = "✅" if ZEABUR_TOKEN else "❌ 未配置 ZEABUR_TOKEN"
-    return JSONResponse({"status": "ok", "token": ok})
+    status = "ok" if ZEABUR_TOKEN else "missing_token"
+    return JSONResponse({"status": status, "token_set": bool(ZEABUR_TOKEN)})
 
 
 # ═══════════════════════════════════════════
@@ -424,8 +326,8 @@ async def health():
 
 if __name__ == "__main__":
     import uvicorn
-    print(f"🔧 Zeabur MCP Server")
-    print(f"   SSE:  http://localhost:{PORT}/sse")
-    print(f"   HTTP: http://localhost:{PORT}/mcp")
-    print(f"   Token: {'✅' if ZEABUR_TOKEN else '❌ 未配置'}")
+    print(f"🦊 Zeabur MCP Server")
+    print(f"   SSE:   http://localhost:{PORT}/sse")
+    print(f"   HTTP:  http://localhost:{PORT}/mcp")
+    print(f"   Token: {'✅ 已设置' if ZEABUR_TOKEN else '❌ 未设置'}")
     uvicorn.run(app, host="0.0.0.0", port=PORT, timeout_keep_alive=120)
